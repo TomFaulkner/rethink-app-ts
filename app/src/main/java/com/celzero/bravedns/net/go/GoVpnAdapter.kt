@@ -35,6 +35,7 @@ import com.celzero.bravedns.data.AppConfig.Companion.DOH_INDEX
 import com.celzero.bravedns.data.AppConfig.Companion.DOT_INDEX
 import com.celzero.bravedns.data.AppConfig.Companion.BOOTSTRAP_DNS_IF_NET_DNS_EMPTY
 import com.celzero.bravedns.data.AppConfig.TunnelOptions
+import com.celzero.bravedns.data.SsidItem
 import com.celzero.bravedns.database.ConnectionTrackerRepository
 import com.celzero.bravedns.database.CountryConfig
 import com.celzero.bravedns.database.DnsCryptRelayEndpoint
@@ -42,6 +43,7 @@ import com.celzero.bravedns.database.EventSource
 import com.celzero.bravedns.database.EventType
 import com.celzero.bravedns.database.ProxyEndpoint
 import com.celzero.bravedns.database.Severity
+import com.celzero.bravedns.database.SmartDnsMode
 import com.celzero.bravedns.net.doh.Transaction
 import com.celzero.bravedns.rpnproxy.RpnProxyManager
 import com.celzero.bravedns.rpnproxy.RpnProxyManager.AUTO_SERVER_ID
@@ -164,6 +166,7 @@ class GoVpnAdapter : KoinComponent {
         // TODO: ideally the values required for transport, alg and rdns should be set in the
         // opts itself.
         setRDNS()
+        setPlusStrategy()
         addTransport()
         setWireguardTunnelModeIfNeeded(opts.tunProxyMode)
         setTailscaleIfNeeded()
@@ -1259,7 +1262,7 @@ class GoVpnAdapter : KoinComponent {
                 status
             } else {
                 val status = getProxies()?.getProxy(id)?.status()
-                Logger.d(LOG_TAG_VPN, "$TAG proxy status($id): $status")
+                Logger.vv(LOG_TAG_VPN, "$TAG proxy status($id): $status")
                 Pair(status, "")
             }
         } catch (ex: Exception) {
@@ -1583,7 +1586,18 @@ class GoVpnAdapter : KoinComponent {
         isMobileActive: Boolean,
         ssid: String
     ) {
+        // when external wireguard automation is enabled, the network
+        // observer must not pause/resume wg proxies, or it would undo tasker's state,
+        // see VpnControlReceiver
+        val wgTaskerOwned = persistentState.wgTaskerAutomationEnabled
+        if (wgTaskerOwned) {
+            Logger.i(
+                LOG_TAG_VPN,
+                "$TAG wg tasker automation enabled, skipping network-driven wg pause/resume"
+            )
+        }
         wgConfigs.forEach {
+            if (wgTaskerOwned) return@forEach
             val id = ID_WG_BASE + it.getId()
             val files = WireguardManager.getConfigFilesById(it.getId())
             // if the proxy is one-wg then mobile-only/ssid automaton doesn't apply
@@ -1593,7 +1607,8 @@ class GoVpnAdapter : KoinComponent {
 
             val useOnlyOnSsid = files?.ssidEnabled == true && !files.oneWireGuard
             val configuredSsids = files?.ssids.orEmpty()
-            val ssidMatch = WireguardManager.matchesSsidList(configuredSsids, ssid) && ssid.isNotEmpty()
+            val ssidMatch = SsidItem.parseStorageList(configuredSsids).isEmpty() ||
+                (ssid.isNotEmpty() && WireguardManager.matchesSsidList(configuredSsids, ssid))
             val canResumeSsidWg = useOnlyOnSsid && ssidMatch
 
             val canResume = canResumeMobileWg || canResumeSsidWg
@@ -1654,18 +1669,30 @@ class GoVpnAdapter : KoinComponent {
         if (!RpnProxyManager.isRpnActive()) {
             return
         }
+        // Relay (hop) traffic enters via AUTO, so a relayed config's pause/resume state
+        // is driven by AUTO's automation settings (mobile-only / SSID) rather than its
+        // own; the pause/resume actions below still target the relayed proxy itself.
+        val hasRelayedConfigs =
+            rpnConfigs.any { !it.key.contains(AUTO_SERVER_ID, ignoreCase = true) && it.hopEnabled }
+        val autoConfig =
+            if (hasRelayedConfigs) runCatching { RpnProxyManager.getAutoServer() }.getOrNull() else null
         rpnConfigs.forEach {
-            val key = if (it.key.contains(AUTO_SERVER_ID, ignoreCase = true)) {
+            val isAuto = it.key.contains(AUTO_SERVER_ID, ignoreCase = true)
+            val key = if (isAuto) {
                 ""
             } else {
                 it.key
             }
-            val isWireGuardMobileOnly = it.mobileOnly
+            val automationConfig = if (!isAuto && it.hopEnabled) autoConfig else it
+            // true when the pause/resume conditions below were inherited from AUTO
+            val automationViaAuto = !isAuto && it.hopEnabled
+            val isWireGuardMobileOnly = automationConfig?.mobileOnly == true
             val canResumeMobileWg = isWireGuardMobileOnly && isMobileActive
 
-            val useOnlyOnSsid = it.ssidBased
-            val configuredSsids = it.ssids
-            val ssidMatch = RpnProxyManager.matchesSsidList(configuredSsids, ssid) && ssid.isNotEmpty()
+            val useOnlyOnSsid = automationConfig?.ssidBased == true
+            val configuredSsids = automationConfig?.ssids.orEmpty()
+            val ssidMatch = SsidItem.parseStorageList(configuredSsids).isEmpty() ||
+                (ssid.isNotEmpty() && RpnProxyManager.matchesSsidList(configuredSsids, ssid))
             val canResumeSsidWg = useOnlyOnSsid && ssidMatch
 
             val canResume = canResumeMobileWg || canResumeSsidWg
@@ -1693,7 +1720,7 @@ class GoVpnAdapter : KoinComponent {
                 logEvent(
                     Severity.LOW,
                     "rpn proxy paused",
-                    "rpn proxy with id $key paused, reason: mobile data"
+                    "rpn proxy with id $key paused, reason: mobile data${if (automationViaAuto) " (auto)" else ""}"
                 )
             } else if (useOnlyOnSsid && !ssidMatch && !canResume) {
                 // when the ssidEnabled is set and the ssid does not match
@@ -1702,7 +1729,7 @@ class GoVpnAdapter : KoinComponent {
                 logEvent(
                     Severity.LOW,
                     "rpn proxy paused",
-                    "rpn proxy with id $key paused, reason: ssid mismatch"
+                    "rpn proxy with id $key paused, reason: ssid mismatch${if (automationViaAuto) " (auto)" else ""}"
                 )
             }
 
@@ -1725,7 +1752,7 @@ class GoVpnAdapter : KoinComponent {
             if (id == Backend.RpnWin || id.startsWith(Backend.RpnWin)) {
                 val win = getWinByKey(id)
                 val stats = win?.router()?.stat()
-                Logger.d(LOG_TAG_VPN, "$TAG rpn-win proxy status: $stats")
+                Logger.vv(LOG_TAG_VPN, "$TAG rpn-win proxy status: $stats")
                 stats
             } else {
                 val stats = getProxies()?.getProxy(id)?.router()?.stat()
@@ -3107,6 +3134,23 @@ class GoVpnAdapter : KoinComponent {
         }
     }
 
+    suspend fun rpnRemoteService() {
+        if (!tunnel.isConnected) {
+            Logger.e(LOG_TAG_VPN, "$TAG no tunnel, skip set experimental settings")
+            return
+        }
+
+        val server = tunnel.services?.addServer("", "", "")
+        val bri = tunnel.services?.bridge(server?.id(), "wg1-id")
+        // server?.hop() does the same thing as bridge but requires object
+        // remove the server
+        tunnel.services?.removeServer(server?.id())
+        // remove the bridge
+        tunnel.services?.bridge(server?.id(), "")
+
+        server?.status()
+    }
+
     suspend fun getWinByKey(key: String): Proxy? {
         if (!tunnel.isConnected) {
             Logger.i(LOG_TAG_PROXY, "$TAG no tunnel, skip get win(rpn) by key")
@@ -3623,6 +3667,10 @@ class GoVpnAdapter : KoinComponent {
     }
 
     suspend fun addMultipleDnsAsPlus() {
+        // v058, for now the hostnames are not replaced with the ips, add a user settings?
+        // or enable it when firestack starts accepting urls (one with host name, another with ips)
+        // firestack will decide whether to use the ip based or host name based urls
+        val canReplaceHostWithIp = false
         if (!tunnel.isConnected) {
             Logger.e(LOG_TAG_VPN, "$TAG; smart-dns; no tunnel, skip set multi dns as plus")
             return
@@ -3637,6 +3685,10 @@ class GoVpnAdapter : KoinComponent {
         // the tunnel handles concurrent transport additions; fire them off without
         // awaiting completion. each job logs its own success/failure.
         dohList.forEach { doh ->
+            if (!tunnel.isConnected) {
+                Logger.e(LOG_TAG_VPN, "$TAG; smart-dns; no tunnel, skip set multi dns as plus")
+                return
+            }
             io {
                 try {
                     var url = doh.dohURL
@@ -3653,7 +3705,7 @@ class GoVpnAdapter : KoinComponent {
                         Logger.d(LOG_TAG_VPN, "$TAG smart-dns; changing url from https to http for $url")
                         url = url.replace("https", "http")
                     }
-                    url = replaceHostWithIp(url, ips)
+                    url = if (canReplaceHostWithIp) replaceHostWithIp(url, ips) else url
                     // add replaces the existing transport with the same id if successful
                     // so no need to remove the transport before adding
                     Intra.addDoHTransport(tunnel, id, url, ips)
@@ -3669,16 +3721,16 @@ class GoVpnAdapter : KoinComponent {
 
         // DoT endpoints
         dots.forEach { dot ->
+            if (!tunnel.isConnected) {
+                Logger.e(LOG_TAG_VPN, "$TAG; smart-dns; no tunnel, skip set multi dns as plus")
+                return
+            }
             io {
                 var url: String? = null
                 try {
                     // default transport-id(Plus), append index & individual id with this
                     val id = Backend.Plus + DOT_INDEX + dot.id
                     url = dot.url
-                    // skip mullvad dots
-                    if (url.contains("mullvad.net") || url.contains("mullvad.org")) {
-                        return@io
-                    }
                     // if tls is present, remove it and pass it to getIpString
                     val ips: String = getIpString(context, url.replace("tls://", ""))
                     if (ips.isEmpty()) {
@@ -3774,12 +3826,21 @@ class GoVpnAdapter : KoinComponent {
         return false
     }
 
-    fun setPlusStrategy(option: Long): Tunnel {
-        // Settings.PlusFilterSafest, Settings.PlusOrderFastest
-        // default value for PlusStrategy is Safest, which is the safest strategy
-        // fastest is another strategy, which is not used for now (v055n)
-        Settings.setPlusStrategy(Settings.PlusFilterSafest)
-        return tunnel
+    suspend fun setPlusStrategy() {
+        if (appConfig.getDnsType().isSmartDns()) {
+            val chosenSmartDns = appConfig.getSelectedSmartDnsEndpoint()
+            if (chosenSmartDns == null) {
+                Settings.setPlusStrategy(Settings.PlusOrderFastest, Settings.PlusFilterAdblock)
+                Logger.w(LOG_TAG_VPN, "$TAG no smart dns endpoint selected, using default(PlusFilterAdblock)")
+            } else {
+                val mode = SmartDnsMode.getTunMode(chosenSmartDns.dnsMode)
+                Settings.setPlusStrategy(Settings.PlusOrderFastest, mode)
+                Logger.i(LOG_TAG_VPN, "$TAG smart dns endpoint selected: $chosenSmartDns, mode: $mode")
+            }
+        } else {
+            Settings.setPlusStrategy(Settings.PlusOrderFastest, Settings.PlusFilterAdblock)
+            Logger.i(LOG_TAG_VPN, "$TAG not smart dns, using default(PlusFilterAdblock)")
+        }
     }
 
     fun tunMtu(): Int {

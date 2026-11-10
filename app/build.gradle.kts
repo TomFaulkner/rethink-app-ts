@@ -1,23 +1,10 @@
 import com.android.build.api.variant.FilterConfiguration
-import org.gradle.api.DefaultTask
-import org.gradle.api.file.ConfigurableFileCollection
-import org.gradle.api.file.RegularFileProperty
-import org.gradle.api.tasks.InputFile
-import org.gradle.api.tasks.InputFiles
-import org.gradle.api.tasks.OutputFile
-import org.gradle.api.tasks.PathSensitive
-import org.gradle.api.tasks.PathSensitivity
-import org.gradle.api.tasks.TaskAction
 import org.jetbrains.kotlin.gradle.dsl.JvmTarget
 import org.jetbrains.kotlin.gradle.dsl.KotlinVersion
 import java.util.Properties
-import java.io.ByteArrayOutputStream
 import java.io.FileInputStream
 import java.lang.reflect.Method
 import java.net.URL
-import java.util.zip.ZipEntry
-import java.util.zip.ZipInputStream
-import java.util.zip.ZipOutputStream
 
 plugins {
     id("com.android.application")
@@ -359,7 +346,7 @@ android {
             // value is set in AndroidManifest.xml so setting it here
             // for build type alpha, versionCode is set in env overriding gradle.properties
             versionCode = getVersionCode()
-            versionName = gitVersion
+            versionName = "v0.2.0-ts"
             buildConfigField("int", "BASE_VERSION_CODE", appVersionCode.toString())
             vectorDrawables.useSupportLibrary = true
         }
@@ -367,7 +354,7 @@ android {
             dimension = "releaseType"
             applicationIdSuffix = ".tv"
             versionCode = getVersionCode()
-            versionName = gitVersion
+            versionName = "v0.2.0-ts"
             buildConfigField("int", "BASE_VERSION_CODE", appVersionCode.toString())
             vectorDrawables.useSupportLibrary = true
         }
@@ -437,29 +424,6 @@ val download by configurations.creating {
     isTransitive = false
 }
 
-// Upstream firestack (gradle.properties firestackCommit). The checked-in
-// tailscale AAR is an older combined bind; its classes.jar lacks v0.5.8
-// APIs (PlusFilter*, DomainOpts, 3-arg addServer). Compile against upstream
-// firestack classes plus the tailscale Java package from the local AAR.
-// Rebuilding libgojni.so (gomobile) is not done here.
-val firestackAar by configurations.creating {
-    isTransitive = false
-    isCanBeResolved = true
-    isCanBeConsumed = false
-}
-
-val firestackRepo = project.findProperty("firestackRepo")?.toString() ?: "github"
-val firestackCommit = project.findProperty("firestackCommit")?.toString() ?: "main"
-
-fun firestackDependency(): String {
-    return when (firestackRepo) {
-        "jitpack" -> "com.github.celzero:firestack:$firestackCommit@aar"
-        "github" -> "com.github.celzero:firestack:$firestackCommit@aar"
-        "ossrh" -> "com.celzero:firestack:$firestackCommit@aar"
-        else -> throw GradleException("Unknown firestackRepo: $firestackRepo")
-    }
-}
-
 // ---------------------------------------------------------------------
 // Embedded-Tailscale AAR (gomobile bind of ./tailscale, see
 // .github/workflows/tailscale-aar.yml). Resolution modes:
@@ -521,77 +485,10 @@ if (tailscaleRepo == "release" && !localTailscaleAar.exists()) {
     }
 }
 
-val mergedTailscaleAar = layout.buildDirectory.file("tailscale/firestack-plus-tailscale.aar")
-
-// Zip upstream firestack with com.celzero.firestack.tailscale.* from the
-// embedded-node AAR. Native libs stay upstream firestack; a combined
-// gomobile bind is required before tailnet dials work on device.
-// A task class (not a script doLast) so the configuration cache can store it.
-abstract class MergeTailscaleFirestackTask : DefaultTask() {
-    @get:InputFiles
-    @get:PathSensitive(PathSensitivity.NONE)
-    abstract val upstreamAar: ConfigurableFileCollection
-
-    @get:InputFile
-    @get:PathSensitive(PathSensitivity.NONE)
-    abstract val tailscaleAarFile: RegularFileProperty
-
-    @get:OutputFile
-    abstract val outputAar: RegularFileProperty
-
-    @TaskAction
-    fun merge() {
-        val upstream = upstreamAar.singleFile
-        val tailscale = tailscaleAarFile.get().asFile
-        val outFile = outputAar.get().asFile
-
-        fun zipEntries(bytes: ByteArray): List<Pair<ZipEntry, ByteArray>> {
-            val items = ArrayList<Pair<ZipEntry, ByteArray>>()
-            ZipInputStream(bytes.inputStream()).use { zis ->
-                while (true) {
-                    val entry = zis.nextEntry ?: break
-                    if (!entry.isDirectory) items.add(ZipEntry(entry.name) to zis.readBytes())
-                }
-            }
-            return items
-        }
-
-        fun entryBytes(entries: List<Pair<ZipEntry, ByteArray>>, name: String): ByteArray {
-            return entries.firstOrNull { it.first.name == name }?.second
-                ?: throw GradleException("tailscale: missing $name")
-        }
-
-        val upstreamEntries = zipEntries(upstream.readBytes())
-        val tailscaleEntries = zipEntries(tailscale.readBytes())
-        val mergedClasses = ByteArrayOutputStream()
-        ZipOutputStream(mergedClasses).use { zos ->
-            val seen = HashSet<String>()
-            fun writeJar(jar: ByteArray, include: (String) -> Boolean) {
-                zipEntries(jar).forEach { (entry, bytes) ->
-                    if (!include(entry.name) || !seen.add(entry.name)) return@forEach
-                    zos.putNextEntry(ZipEntry(entry.name))
-                    zos.write(bytes)
-                    zos.closeEntry()
-                }
-            }
-            writeJar(entryBytes(upstreamEntries, "classes.jar")) { true }
-            writeJar(entryBytes(tailscaleEntries, "classes.jar")) {
-                it.startsWith("com/celzero/firestack/tailscale/")
-            }
-        }
-        outFile.parentFile.mkdirs()
-        ZipOutputStream(outFile.outputStream()).use { zos ->
-            upstreamEntries.forEach { (entry, bytes) ->
-                zos.putNextEntry(ZipEntry(entry.name))
-                if (entry.name == "classes.jar") zos.write(mergedClasses.toByteArray())
-                else zos.write(bytes)
-                zos.closeEntry()
-            }
-        }
-        logger.lifecycle("tailscale: merged ${tailscale.name} classes into ${upstream.name} -> $outFile")
-    }
-}
-
+// The file at app/libs/tailscale.aar (or the path below) must be the combined
+// gomobile bind: firestack packages plus com.celzero.firestack.tailscale in
+// one libgojni.so. Do not zip this together with the Maven firestack AAR;
+// that keeps upstream natives and tailnet dials fail on device.
 val tailscaleAarInput = when {
     localTailscaleAar.exists() -> localTailscaleAar
     tailscaleRepo == "local" -> {
@@ -604,15 +501,6 @@ val tailscaleAarInput = when {
         f
     }
     else -> downloadedTailscaleAar
-}
-
-tasks.register<MergeTailscaleFirestackTask>("mergeTailscaleFirestack") {
-    upstreamAar.setFrom(firestackAar)
-    tailscaleAarFile.set(tailscaleAarInput)
-    outputAar.set(mergedTailscaleAar)
-    if (!localTailscaleAar.exists() && tailscaleRepo == "release") {
-        dependsOn("downloadTailscaleAar")
-    }
 }
 
 dependencies {
@@ -685,15 +573,13 @@ dependencies {
     "fullImplementation"(libs.githubKirich1409Viewbindingpropertydelegate)
     "fullImplementation"(libs.githubKirich1409ViewbindingpropertydelegateNoreflection)
 
-    add("firestackAar", firestackDependency())
-
-    // Upstream firestack classes (v0.5.8 API) plus the tailscale Java package.
-    // One AAR only: gomobile hardcodes libgojni.so / go.Seq, so the two
-    // published AARs cannot both be packaged. The merged AAR's native lib is
-    // upstream firestack; a combined bind is required before tailnet dials work.
-    val mergedEngineAar = files(mergedTailscaleAar)
-    mergedEngineAar.builtBy("mergeTailscaleFirestack")
-    implementation(mergedEngineAar)
+    // Combined firestack (go.mod pin, same revision as firestackCommit) plus
+    // the tailscale engine. One AAR: gomobile hardcodes libgojni.so / go.Seq.
+    val combinedEngineAar = files(tailscaleAarInput)
+    if (!localTailscaleAar.exists() && tailscaleRepo == "release") {
+        combinedEngineAar.builtBy("downloadTailscaleAar")
+    }
+    implementation(combinedEngineAar)
 
     // Work manager
     implementation(libs.androidxWorkWorkRuntimeKtx) {

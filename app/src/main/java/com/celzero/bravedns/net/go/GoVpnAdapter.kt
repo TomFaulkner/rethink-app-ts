@@ -123,6 +123,15 @@ class GoVpnAdapter : KoinComponent {
     private var context: Context
     private var externalScope: CoroutineScope
 
+    // Address last handed to firestack for the Tailscale socks5 proxy and its
+    // DNS transport. GetAddr() is the last dial's remote address, not the URL
+    // we registered, so a refresh cannot learn the configured URL from the
+    // proxy itself. Remembering it lets a network-change refresh leave a
+    // healthy endpoint alone instead of addProxy/addDNSProxy, which replace
+    // the existing one and drop tailnet connections.
+    private var tailscaleProxyUrl: String? = null
+    private var tailscaleDnsAddr: String? = null
+
     constructor(
         context: Context,
         externalScope: CoroutineScope,
@@ -912,23 +921,44 @@ class GoVpnAdapter : KoinComponent {
             return
         }
         try {
-            val res = getProxies()?.addProxy(TailscaleManager.ID_TS_BASE, url)
-            GlobalProxyHandler.track(TailscaleManager.ID_TS_BASE)
+            val proxyId = TailscaleManager.ID_TS_BASE
+            // Same health signal as refreshOrReAddProxies: null means the
+            // proxy is missing, TNT means it is up but not responding.
+            val proxyStatus = getProxyStatusById(proxyId).first
+            val knownProxyAddr = tailscaleProxyUrl ?: getProxyAddrById(proxyId)
+            if (shouldReaddEndpoint(proxyStatus, knownProxyAddr, url)) {
+                val res = getProxies()?.addProxy(proxyId, url)
+                if (res != null) tailscaleProxyUrl = url
+                GlobalProxyHandler.track(proxyId)
+                Logger.i(
+                    LOG_TAG_VPN,
+                    "$TAG tailscale proxy added (${redactCreds(url)}), success? ${res != null}"
+                )
+                logEvent(
+                    Severity.LOW,
+                    "set tailscale proxy",
+                    "tailscale socks5 proxy added with url: ${redactCreds(url)}"
+                )
+            } else {
+                Logger.i(LOG_TAG_VPN, "$TAG tailscale proxy already healthy, skip re-add")
+            }
+
             // socks5 proxies carry no per-proxy DNS (firestack's AddProxyDNS
             // requires p.DNS(), implemented only by WireGuard), so register
             // the engine's loopback resolver as a plain-DNS transport. The id
             // must NOT match the proxy id, else firestack relays queries for
             // it through that very socks5 endpoint (no UDP there)
-            Intra.addDNSProxy(tunnel, TailscaleManager.ID_TS_DNS, TailscaleManager.TS_DNS_ADDR)
-            Logger.i(
-                LOG_TAG_VPN,
-                "$TAG tailscale proxy added (${redactCreds(url)}), success? ${res != null}, dns? ${TailscaleManager.TS_DNS_ADDR}"
-            )
-            logEvent(
-                Severity.LOW,
-                "set tailscale proxy",
-                "tailscale socks5 proxy added with url: ${redactCreds(url)}"
-            )
+            val dnsId = TailscaleManager.ID_TS_DNS
+            val dnsAddr = TailscaleManager.TS_DNS_ADDR
+            val dnsStatus = getDnsStatus(dnsId)
+            val knownDnsAddr = tailscaleDnsAddr ?: dnsTransportAddr(dnsId)
+            if (shouldReaddEndpoint(dnsStatus, knownDnsAddr, dnsAddr)) {
+                Intra.addDNSProxy(tunnel, dnsId, dnsAddr)
+                tailscaleDnsAddr = dnsAddr
+                Logger.i(LOG_TAG_VPN, "$TAG tailscale dns transport added ($dnsAddr)")
+            } else {
+                Logger.i(LOG_TAG_VPN, "$TAG tailscale dns transport already healthy, skip re-add")
+            }
             ts.applyPendingPrefs()
         } catch (e: Exception) {
             Logger.e(LOG_TAG_VPN, "$TAG err adding tailscale proxy: ${e.message}", e)
@@ -950,6 +980,8 @@ class GoVpnAdapter : KoinComponent {
         try {
             removeResolver(TailscaleManager.ID_TS_DNS)
             getProxies()?.removeProxy(TailscaleManager.ID_TS_BASE)
+            tailscaleProxyUrl = null
+            tailscaleDnsAddr = null
             GlobalProxyHandler.untrack(TailscaleManager.ID_TS_BASE)
             Logger.i(LOG_TAG_VPN, "$TAG removed tailscale proxy")
             logEvent(Severity.LOW, "remove tailscale proxy", "removed tailscale socks5 proxy")
@@ -1893,6 +1925,16 @@ class GoVpnAdapter : KoinComponent {
         }
     }
 
+    private suspend fun dnsTransportAddr(id: String): String? {
+        return try {
+            val transport = getResolver()?.get(id)
+            if (transport?.id() == id) transport.addr else null
+        } catch (e: Exception) {
+            Logger.w(LOG_TAG_VPN, "$TAG err dns addr($id): ${e.message}")
+            null
+        }
+    }
+
     suspend fun getDnsStatus(id: String): Int? {
         try {
             val transport = getResolver()?.get(id)
@@ -2491,6 +2533,45 @@ class GoVpnAdapter : KoinComponent {
 
         // on system dns changes, set the system dns if default dns is none and loopback is true
         private const val SET_SYS_DNS_AS_DEFAULT_IFF_LOOPBACK = true
+
+        /**
+         * True when a proxy or DNS transport must be registered again.
+         * Missing (null status) and [Backend.TNT] match the WireGuard refresh
+         * path in [refreshOrReAddProxies]. A healthy endpoint whose address
+         * still matches [desiredAddr] is left alone.
+         */
+        internal fun shouldReaddEndpoint(status: Int?, knownAddr: String?, desiredAddr: String): Boolean {
+            if (status == null || status == Backend.TNT) return true
+            if (knownAddr.isNullOrEmpty()) return true
+            return !endpointAddrsEqual(knownAddr, desiredAddr)
+        }
+
+        /**
+         * Full URL or host:port. When both sides carry userinfo, only an exact
+         * match counts so a rotated socks5 secret is treated as a new URL.
+         * GetAddr() before the first dial is host:port with no userinfo, and
+         * that still matches the URL we registered.
+         */
+        internal fun endpointAddrsEqual(known: String, desired: String): Boolean {
+            if (known == desired) return true
+            if (hasUserInfo(known) && hasUserInfo(desired)) return false
+            val knownHost = endpointHostPort(known)
+            val desiredHost = endpointHostPort(desired)
+            return knownHost.isNotEmpty() && knownHost == desiredHost
+        }
+
+        private fun hasUserInfo(urlOrHostPort: String): Boolean {
+            val afterScheme = urlOrHostPort.substringAfter("://", urlOrHostPort)
+            return '@' in afterScheme
+        }
+
+        internal fun endpointHostPort(urlOrHostPort: String): String {
+            val raw = urlOrHostPort.trim()
+            if (raw.isEmpty()) return ""
+            val afterScheme = raw.substringAfter("://", raw)
+            val afterUser = if ('@' in afterScheme) afterScheme.substringAfter('@') else afterScheme
+            return afterUser.substringBefore('/').substringBefore('?').substringBefore('#')
+        }
 
         fun getIpString(context: Context?, url: String?): String {
             if (url.isNullOrEmpty()) return ""
